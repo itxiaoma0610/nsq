@@ -31,11 +31,14 @@ func main() {
 }
 
 func (p *program) Init(env svc.Environment) error {
+	// 设置默认值
 	opts := nsqd.NewOptions()
-
+	// 命令行参数先设置默认值
 	flagSet := nsqdFlagSet(opts)
+	// 解析命令行参数
 	flagSet.Parse(os.Args[1:])
 
+	// 使用时间作为随机种子值
 	rand.Seed(time.Now().UTC().UnixNano())
 
 	if flagSet.Lookup("version").Value.(flag.Getter).Get().(bool) {
@@ -53,6 +56,7 @@ func (p *program) Init(env svc.Environment) error {
 	}
 	cfg.Validate()
 
+	// 把flagset和cfg的值合并放到opts中
 	options.Resolve(opts, flagSet, cfg)
 
 	nsqd, err := nsqd.New(opts)
@@ -65,16 +69,19 @@ func (p *program) Init(env svc.Environment) error {
 }
 
 func (p *program) Start() error {
+	// 加载元数据 topic和channel信息
 	err := p.nsqd.LoadMetadata()
 	if err != nil {
 		logFatal("failed to load metadata - %s", err)
 	}
+	// 持久化元数据
 	err = p.nsqd.PersistMetadata()
 	if err != nil {
 		logFatal("failed to persist metadata - %s", err)
 	}
 
 	go func() {
+		// 启动nsqd
 		err := p.nsqd.Main()
 		if err != nil {
 			p.Stop()
