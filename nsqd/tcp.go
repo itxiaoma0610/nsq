@@ -19,7 +19,9 @@ type Client interface {
 }
 
 type tcpServer struct {
-	nsqd  *NSQD
+	nsqd *NSQD
+
+	// 存储客户端的链接信息, 当有一个tcp连接的时候会存入此map
 	conns sync.Map
 }
 
@@ -30,6 +32,7 @@ func (p *tcpServer) Handle(conn net.Conn) {
 	// the version of the protocol that it intends to communicate, this will allow us
 	// to gracefully upgrade the protocol away from text/line oriented to whatever...
 	buf := make([]byte, 4)
+	// 会阻塞，直到读够四字节
 	_, err := io.ReadFull(conn, buf)
 	if err != nil {
 		p.nsqd.logf(LOG_ERROR, "failed to read protocol version - %s", err)
@@ -52,7 +55,7 @@ func (p *tcpServer) Handle(conn net.Conn) {
 			conn.RemoteAddr(), protocolMagic)
 		return
 	}
-
+	// 对新建立的连接conn 创建一个client
 	client := prot.NewClient(conn)
 	p.conns.Store(conn.RemoteAddr(), client)
 

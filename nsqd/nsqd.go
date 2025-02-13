@@ -38,13 +38,16 @@ type errStore struct {
 
 type NSQD struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
+	// 节点内递增的客户端 id 序号, 为每个到来的客户端请求分配唯一的标识 id
 	clientIDSequence int64
 
+	// 一把读写锁，保证临界资源安全并发
 	sync.RWMutex
 	ctx context.Context
 	// ctxCancel cancels a context that main() is waiting on
 	ctxCancel context.CancelFunc
 
+	// 存储options信息
 	opts atomic.Value
 
 	dl        *dirlock.DirLock
@@ -53,13 +56,19 @@ type NSQD struct {
 	errValue  atomic.Value
 	startTime time.Time
 
+	// 存储 topic 集合信息
 	topicMap map[string]*Topic
 
+	//集群中的其他nsqd节点
 	lookupPeers atomic.Value
 
-	tcpServer       *tcpServer
-	tcpListener     net.Listener
-	httpListener    net.Listener
+	// 运行的 tcp server
+	tcpServer *tcpServer
+	// tcp server 使用的端口监听器
+	tcpListener net.Listener
+	// http server 使用的端口监听器
+	httpListener net.Listener
+	//https server 使用的端口监听器
 	httpsListener   net.Listener
 	tlsConfig       *tls.Config
 	clientTLSConfig *tls.Config
@@ -68,15 +77,18 @@ type NSQD struct {
 
 	notifyChan           chan interface{}
 	optsNotificationChan chan struct{}
-	exitChan             chan int
-	waitGroup            util.WaitGroupWrapper
-
+	// 用于回收派生出去的 goroutine
+	exitChan chan int
+	//并发等待组工具，保证派发出去的goroutine都能得到及时回收
+	waitGroup util.WaitGroupWrapper
+	//集群信息
 	ci *clusterinfo.ClusterInfo
 }
 
 func New(opts *Options) (*NSQD, error) {
 	var err error
 
+	// diskqueue 数据存储路径
 	dataPath := opts.DataPath
 	if opts.DataPath == "" {
 		cwd, _ := os.Getwd()
@@ -87,22 +99,26 @@ func New(opts *Options) (*NSQD, error) {
 	}
 
 	n := &NSQD{
-		startTime:            time.Now(),
+		startTime: time.Now(),
+		// topic 存储 map
 		topicMap:             make(map[string]*Topic),
 		exitChan:             make(chan int),
 		notifyChan:           make(chan interface{}),
 		optsNotificationChan: make(chan struct{}, 1),
-		dl:                   dirlock.New(dataPath),
+		dl:                   dirlock.New(dataPath), // 目录锁
 	}
+	// 创建 context
 	n.ctx, n.ctxCancel = context.WithCancel(context.Background())
+	// 创建http client
 	httpcli := http_api.NewClient(nil, opts.HTTPClientConnectTimeout, opts.HTTPClientRequestTimeout)
 	n.ci = clusterinfo.New(n.logf, httpcli)
-
+	// 存储 nsqlookup信息
 	n.lookupPeers.Store([]*lookupPeer{})
 
 	n.swapOpts(opts)
 	n.errValue.Store(errStore{})
 
+	// 验证 dataPath 目录是否被占用
 	err = n.dl.Lock()
 	if err != nil {
 		return nil, fmt.Errorf("failed to lock data-path: %v", err)
@@ -148,12 +164,15 @@ func New(opts *Options) (*NSQD, error) {
 	n.logf(LOG_INFO, version.String("nsqd"))
 	n.logf(LOG_INFO, "ID: %d", opts.ID)
 
+	// *创建 tcpserver
 	n.tcpServer = &tcpServer{nsqd: n}
+	// *tcp listener
 	n.tcpListener, err = net.Listen(util.TypeOfAddr(opts.TCPAddress), opts.TCPAddress)
 	if err != nil {
 		return nil, fmt.Errorf("listen (%s) failed - %s", opts.TCPAddress, err)
 	}
 	if opts.HTTPAddress != "" {
+		// 创建http listener
 		n.httpListener, err = net.Listen(util.TypeOfAddr(opts.HTTPAddress), opts.HTTPAddress)
 		if err != nil {
 			return nil, fmt.Errorf("listen (%s) failed - %s", opts.HTTPAddress, err)
@@ -266,28 +285,36 @@ func (n *NSQD) Main() error {
 		})
 	}
 
+	// tcp
 	n.waitGroup.Wrap(func() {
-		exitFunc(protocol.TCPServer(n.tcpListener, n.tcpServer, n.logf))
+		// exitFunc(protocol.TCPServer(n.tcpListener, n.tcpServer, n.logf))
+		// 创建 tcp Server 里面是个无限 for 循环
+		err := protocol.TCPServer(n.tcpListener, n.tcpServer, n.logf)
+		exitFunc(err)
 	})
+	// http
 	if n.httpListener != nil {
 		httpServer := newHTTPServer(n, false, n.getOpts().TLSRequired == TLSRequired)
 		n.waitGroup.Wrap(func() {
 			exitFunc(http_api.Serve(n.httpListener, httpServer, "HTTP", n.logf))
 		})
 	}
+	// https
 	if n.httpsListener != nil {
 		httpsServer := newHTTPServer(n, true, true)
 		n.waitGroup.Wrap(func() {
 			exitFunc(http_api.Serve(n.httpsListener, httpsServer, "HTTPS", n.logf))
 		})
 	}
-
+	// 维护 channel 中的延时队列和等待消息确认队列
 	n.waitGroup.Wrap(n.queueScanLoop)
+	// 连接到nsqlookupd
 	n.waitGroup.Wrap(n.lookupLoop)
 	if n.getOpts().StatsdAddress != "" {
 		n.waitGroup.Wrap(n.statsdLoop)
 	}
 
+	// 会一直阻塞
 	err := <-exitCh
 	return err
 }
@@ -483,7 +510,7 @@ func (n *NSQD) Exit() {
 // to return a pointer to a Topic object (potentially new)
 func (n *NSQD) GetTopic(topicName string) *Topic {
 	// most likely we already have this topic, so try read lock first
-	n.RLock()
+	n.RLock() // 读锁 如果已经存在了直接读取
 	t, ok := n.topicMap[topicName]
 	n.RUnlock()
 	if ok {
@@ -491,7 +518,9 @@ func (n *NSQD) GetTopic(topicName string) *Topic {
 	}
 
 	n.Lock()
-
+	// double check
+	// 获取到写锁, 先判断topic是否已经存在
+	// 获取锁的时候，可能获取不到锁，程序会阻塞，再次获取到锁的时候，需要判断竞态资源状态是否改变
 	t, ok = n.topicMap[topicName]
 	if ok {
 		n.Unlock()
@@ -500,6 +529,7 @@ func (n *NSQD) GetTopic(topicName string) *Topic {
 	deleteCallback := func(t *Topic) {
 		n.DeleteExistingTopic(t.name)
 	}
+	// 创建topic
 	t = NewTopic(topicName, n, deleteCallback)
 	n.topicMap[topicName] = t
 
@@ -588,6 +618,7 @@ func (n *NSQD) Notify(v interface{}, persist bool) {
 				return
 			}
 			n.Lock()
+			// 持久化
 			err := n.PersistMetadata()
 			if err != nil {
 				n.logf(LOG_ERROR, "failed to persist metadata - %s", err)

@@ -20,6 +20,8 @@ func (p *tcpServer) Handle(conn net.Conn) {
 	// the version of the protocol that it intends to communicate, this will allow us
 	// to gracefully upgrade the protocol away from text/line oriented to whatever...
 	buf := make([]byte, 4)
+	// 会阻塞，直到读取够4字节(space space V2)
+	// 做版本号的校验
 	_, err := io.ReadFull(conn, buf)
 	if err != nil {
 		p.nsqlookupd.logf(LOG_ERROR, "failed to read protocol version - %s", err)

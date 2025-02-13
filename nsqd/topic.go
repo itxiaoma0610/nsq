@@ -15,21 +15,32 @@ import (
 
 type Topic struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
+	//统计消息数量和大小
 	messageCount uint64
 	messageBytes uint64
 
+	//读写锁，保证临界资源并发安全
 	sync.RWMutex
 
-	name              string
-	channelMap        map[string]*Channel
-	backend           BackendQueue
-	memoryMsgChan     chan *Message
-	startChan         chan int
-	exitChan          chan int
+	//当前 topic 名称
+	name string
+	// 当前topic下存在的channel集合
+	channelMap map[string]*Channel
+	// 当memoryMsgChan满了， 消息通过该组件持久化落盘
+	backend BackendQueue
+	// 用于在内存中传递当前 topic 下的消息
+	memoryMsgChan chan *Message
+	//通知 pump goroutine启动
+	startChan chan int
+	//通知pump goroutine 退出
+	exitChan chan int
+	//通知pump goroutine channels有更新
 	channelUpdateChan chan int
-	waitGroup         util.WaitGroupWrapper
-	exitFlag          int32
-	idFactory         *guidFactory
+	//等待组工具，保证当前topic下派生出的goroutine能够被回收
+	waitGroup util.WaitGroupWrapper
+	exitFlag  int32
+	//消息id生成器
+	idFactory *guidFactory
 
 	ephemeral      bool
 	deleteCallback func(*Topic)
@@ -45,7 +56,7 @@ type Topic struct {
 func NewTopic(topicName string, nsqd *NSQD, deleteCallback func(*Topic)) *Topic {
 	t := &Topic{
 		name:              topicName,
-		channelMap:        make(map[string]*Channel),
+		channelMap:        make(map[string]*Channel), // 存储Topic下的Channel信息
 		memoryMsgChan:     make(chan *Message, nsqd.getOpts().MemQueueSize),
 		startChan:         make(chan int, 1),
 		exitChan:          make(chan int),
@@ -54,10 +65,12 @@ func NewTopic(topicName string, nsqd *NSQD, deleteCallback func(*Topic)) *Topic 
 		paused:            0,
 		pauseChan:         make(chan int),
 		deleteCallback:    deleteCallback,
-		idFactory:         NewGUIDFactory(nsqd.getOpts().ID),
+		idFactory:         NewGUIDFactory(nsqd.getOpts().ID), // 消息ID工厂
 	}
+	// 根据 topic 的名称后缀判断是否为临时 topic
 	if strings.HasSuffix(topicName, "#ephemeral") {
 		t.ephemeral = true
+		// 临时 topic的memoryMsgChan满了, 新的message 不会写入Disk
 		t.backend = newDummyBackendQueue()
 	} else {
 		dqLogf := func(level diskqueue.LogLevel, f string, args ...interface{}) {
@@ -76,6 +89,8 @@ func NewTopic(topicName string, nsqd *NSQD, deleteCallback func(*Topic)) *Topic 
 		)
 	}
 
+	// 将message分发到topic下的所有channel
+	//启动topic下的pump goroutine
 	t.waitGroup.Wrap(t.messagePump)
 
 	t.nsqd.Notify(t, !t.ephemeral)
@@ -104,6 +119,7 @@ func (t *Topic) GetChannel(channelName string) *Channel {
 	t.Unlock()
 
 	if isNew {
+		// 新增的 Channel
 		// update messagePump state
 		select {
 		case t.channelUpdateChan <- 1:
@@ -229,6 +245,7 @@ func (t *Topic) put(m *Message) error {
 			break // write to backend
 		}
 	}
+	// memoryMsgChan 满了, 会执行 default, 将消息写入磁盘
 	err := writeMessageToBackend(m, t.backend)
 	t.nsqd.SetHealth(err)
 	if err != nil {
@@ -262,8 +279,10 @@ func (t *Topic) messagePump() {
 		case <-t.pauseChan:
 			continue
 		case <-t.exitChan:
+			// Topic 退出
 			goto exit
 		case <-t.startChan:
+			// Topic 启动完成
 		}
 		break
 	}
@@ -273,6 +292,7 @@ func (t *Topic) messagePump() {
 	}
 	t.RUnlock()
 	if len(chans) > 0 && !t.IsPaused() {
+		//获取基于内存的memoryChan和基于磁盘的backendChan
 		memoryMsgChan = t.memoryMsgChan
 		backendChan = t.backend.ReadChan()
 	}
@@ -280,14 +300,18 @@ func (t *Topic) messagePump() {
 	// main message loop
 	for {
 		select {
-		case msg = <-memoryMsgChan:
+		//通过内存通道接收消息
+		case msg = <-memoryMsgChan: // 从消息队列中获取消息
+		//通过磁盘通道接收消息
 		case buf = <-backendChan:
 			msg, err = decodeMessage(buf)
 			if err != nil {
 				t.nsqd.logf(LOG_ERROR, "failed to decode message - %s", err)
 				continue
 			}
+		//倘若和lookupd通信发送channel有变更，则需要对channels list进行更新
 		case <-t.channelUpdateChan:
+			// 有新的 Channel 加入, 需要更新 chans
 			chans = chans[:0]
 			t.RLock()
 			for _, c := range t.channelMap {
@@ -315,6 +339,7 @@ func (t *Topic) messagePump() {
 			goto exit
 		}
 
+		// 遍历 topic 下所有 channel, 将 topic 消息分发给 channel
 		for i, channel := range chans {
 			chanMsg := msg
 			// copy the message because each channel
@@ -326,10 +351,13 @@ func (t *Topic) messagePump() {
 				chanMsg.Timestamp = msg.Timestamp
 				chanMsg.deferred = msg.deferred
 			}
+			// 倘若消息类型为延时消息，则将其添加到延时队列
 			if chanMsg.deferred != 0 {
+				// 延迟消息
 				channel.PutMessageDeferred(chanMsg, chanMsg.deferred)
 				continue
 			}
+			// 将msg 写入 topic 下的每个 Channel 中
 			err := channel.PutMessage(chanMsg)
 			if err != nil {
 				t.nsqd.logf(LOG_ERROR,

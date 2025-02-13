@@ -37,19 +37,20 @@ func SendResponse(w io.Writer, data []byte) (int, error) {
 func SendFramedResponse(w io.Writer, frameType int32, data []byte) (int, error) {
 	beBuf := make([]byte, 4)
 	size := uint32(len(data)) + 4
-
+	// 消息大小 message size = frameType(4byte) + len(data)
+	// 先把size 的大小写入beBuf 再写入frameType 再写入 data
 	binary.BigEndian.PutUint32(beBuf, size)
 	n, err := w.Write(beBuf)
 	if err != nil {
 		return n, err
 	}
-
+	// 发送 frameType
 	binary.BigEndian.PutUint32(beBuf, uint32(frameType))
 	n, err = w.Write(beBuf)
 	if err != nil {
 		return n + 4, err
 	}
-
+	// 发送 data
 	n, err = w.Write(data)
 	return n + 8, err
 }

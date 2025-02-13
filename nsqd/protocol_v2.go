@@ -40,7 +40,9 @@ func (p *protocolV2) IOLoop(c protocol.Client) error {
 	var err error
 	var line []byte
 	var zeroTime time.Time
-
+	// 类型断言x.(T), x是一个接口类型
+	// T 是具体类型，x的动态类型是否就是T
+	// T 是接口类型， x的动态类型是否满足T
 	client := c.(*clientV2)
 
 	// synchronize the startup of messagePump in order
@@ -48,10 +50,14 @@ func (p *protocolV2) IOLoop(c protocol.Client) error {
 	// goroutine local state derived from client attributes
 	// and avoid a potential race with IDENTIFY (where a client
 	// could have changed or disabled said attributes)
+
+	// 同步channel
 	messagePumpStartedChan := make(chan bool)
 	go p.messagePump(client, messagePumpStartedChan)
+	// 阻塞, 直到close channel
 	<-messagePumpStartedChan
 
+	// 处理客户端发过来的 command
 	for {
 		if client.HeartbeatInterval > 0 {
 			client.SetReadDeadline(time.Now().Add(client.HeartbeatInterval * 2))
@@ -61,6 +67,7 @@ func (p *protocolV2) IOLoop(c protocol.Client) error {
 
 		// ReadSlice does not allocate new space for the data each request
 		// ie. the returned slice is only valid until the next call to it
+		// PUB <topic_name>\n 读取数据， 直到出现第一个 \n
 		line, err = client.Reader.ReadSlice('\n')
 		if err != nil {
 			if err == io.EOF {
@@ -124,14 +131,16 @@ func (p *protocolV2) IOLoop(c protocol.Client) error {
 func (p *protocolV2) SendMessage(client *clientV2, msg *Message) error {
 	p.nsqd.logf(LOG_DEBUG, "PROTOCOL(V2): writing msg(%s) to client(%s) - %s", msg.ID, client, msg.Body)
 
+	// 缓冲池
 	buf := bufferPoolGet()
 	defer bufferPoolPut(buf)
 
+	//ID Body Timestamp Attempts 这几个字段写入缓冲区里面
 	_, err := msg.WriteTo(buf)
 	if err != nil {
 		return err
 	}
-
+	// 发送消息给客户端
 	err = p.Send(client, frameTypeMessage, buf.Bytes())
 	if err != nil {
 		return err
@@ -149,7 +158,7 @@ func (p *protocolV2) Send(client *clientV2, frameType int32, data []byte) error 
 	} else {
 		client.SetWriteDeadline(zeroTime)
 	}
-
+	// client
 	_, err := protocol.SendFramedResponse(client.Writer, frameType, data)
 	if err != nil {
 		client.writeLock.Unlock()
@@ -202,6 +211,7 @@ func (p *protocolV2) Exec(client *clientV2, params [][]byte) ([]byte, error) {
 
 func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 	var err error
+	// 消费者 Channel 的消息队列
 	var memoryMsgChan chan *Message
 	var backendMsgChan <-chan []byte
 	var subChannel *Channel
@@ -211,9 +221,13 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 	var flusherChan <-chan time.Time
 	var sampleRate int32
 
+	// 消费者 订阅事件 channel，只有消费者SubEventChan才会有值
+	//当执行SUB操作时, 会把client要订阅的channel 放入subEventChan中
 	subEventChan := client.SubEventChan
+	// Identify 完成 channel
 	identifyEventChan := client.IdentifyEventChan
 	outputBufferTicker := time.NewTicker(client.OutputBufferTimeout)
+	// 心跳 ticker
 	heartbeatTicker := time.NewTicker(client.HeartbeatInterval)
 	heartbeatChan := heartbeatTicker.C
 	msgTimeout := client.MsgTimeout
@@ -271,8 +285,9 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 			}
 			flushed = true
 		case <-client.ReadyStateChan:
-		case subChannel = <-subEventChan:
+		case subChannel = <-subEventChan: // 消费者订阅事件，获取到具体的 Channel
 			// you can't SUB anymore
+			// 一个 Client 只能订阅一次， 不能多次订阅
 			subEventChan = nil
 		case identifyData := <-identifyEventChan:
 			// you can't IDENTIFY anymore
@@ -319,7 +334,7 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 				goto exit
 			}
 			flushed = false
-		case msg := <-memoryMsgChan:
+		case msg := <-memoryMsgChan: // 从 Channel 中获取消息
 			if sampleRate > 0 && rand.Int31n(100) > sampleRate {
 				continue
 			}
@@ -327,6 +342,7 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 
 			subChannel.StartInFlightTimeout(msg, client.ID, msgTimeout)
 			client.SendingMessage()
+			// 将 channel 中的消息发送给消费者 client
 			err = p.SendMessage(client, msg)
 			if err != nil {
 				goto exit
@@ -580,7 +596,13 @@ func (p *protocolV2) CheckAuth(client *clientV2, cmd, topicName, channelName str
 	return nil
 }
 
+//SUB <topic_name> <channel_name>\n
+//
+//<topic_name> - a valid string (optionally having #ephemeral suffix)
+//<channel_name> - a valid string (optionally having #ephemeral suffix)
+
 func (p *protocolV2) SUB(client *clientV2, params [][]byte) ([]byte, error) {
+	// 判断client状态
 	if atomic.LoadInt32(&client.State) != stateInit {
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "cannot SUB in current state")
 	}
@@ -615,7 +637,9 @@ func (p *protocolV2) SUB(client *clientV2, params [][]byte) ([]byte, error) {
 	var channel *Channel
 	for i := 1; ; i++ {
 		topic := p.nsqd.GetTopic(topicName)
+		// 将channel 添加到 topic
 		channel = topic.GetChannel(channelName)
+		// 将 client 添加到Channel (一个 Channel 可以对应多个 client)
 		if err := channel.AddClient(client.ID, client); err != nil {
 			return nil, protocol.NewFatalClientErr(err, "E_SUB_FAILED", "SUB failed "+err.Error())
 		}
@@ -631,7 +655,7 @@ func (p *protocolV2) SUB(client *clientV2, params [][]byte) ([]byte, error) {
 		break
 	}
 	atomic.StoreInt32(&client.State, stateSubscribed)
-	client.Channel = channel
+	client.Channel = channel // 一个client只能对应一个channel
 	// update message pump
 	client.SubEventChan <- channel
 
@@ -762,19 +786,23 @@ func (p *protocolV2) NOP(client *clientV2, params [][]byte) ([]byte, error) {
 	return nil, nil
 }
 
+// PUB <topic_name>\n
+// [ 4-byte size in bytes ][ N-byte binary data ]
+//
+// <topic_name> - a valid string (optionally having #ephemeral suffix)
 func (p *protocolV2) PUB(client *clientV2, params [][]byte) ([]byte, error) {
 	var err error
 
 	if len(params) < 2 {
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "PUB insufficient number of parameters")
 	}
-
+	// 提取Topic名称，并验证是否合法
 	topicName := string(params[1])
 	if !protocol.IsValidTopicName(topicName) {
 		return nil, protocol.NewFatalClientErr(nil, "E_BAD_TOPIC",
 			fmt.Sprintf("PUB topic name %q is not valid", topicName))
 	}
-
+	// 读取4字节, 获取消息体字节大小
 	bodyLen, err := readLen(client.Reader, client.lenSlice)
 	if err != nil {
 		return nil, protocol.NewFatalClientErr(err, "E_BAD_MESSAGE", "PUB failed to read message body size")
@@ -791,6 +819,7 @@ func (p *protocolV2) PUB(client *clientV2, params [][]byte) ([]byte, error) {
 	}
 
 	messageBody := make([]byte, bodyLen)
+	// 读取消息内容
 	_, err = io.ReadFull(client.Reader, messageBody)
 	if err != nil {
 		return nil, protocol.NewFatalClientErr(err, "E_BAD_MESSAGE", "PUB failed to read message body")
@@ -799,9 +828,11 @@ func (p *protocolV2) PUB(client *clientV2, params [][]byte) ([]byte, error) {
 	if err := p.CheckAuth(client, "PUB", topicName, ""); err != nil {
 		return nil, err
 	}
-
+	// 获取 Topic
 	topic := p.nsqd.GetTopic(topicName)
+	// 创建 Message
 	msg := NewMessage(topic.GenerateID(), messageBody)
+	// 将Message 发送给 Topic 中的队列 channel
 	err = topic.PutMessage(msg)
 	if err != nil {
 		return nil, protocol.NewFatalClientErr(err, "E_PUB_FAILED", "PUB failed "+err.Error())

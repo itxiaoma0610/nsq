@@ -36,23 +36,31 @@ type Consumer interface {
 // messages, timeouts, requeuing, etc.
 type Channel struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
+	// 一些计数器
 	requeueCount uint64
 	messageCount uint64
 	timeoutCount uint64
 
+	//读写锁，保证临界资源并发安全
 	sync.RWMutex
 
+	//从属的topic名称
 	topicName string
-	name      string
-	nsqd      *NSQD
+	//当前channel名称
+	name string
 
+	//从属的nsqd模块
+	nsqd *NSQD
+
+	//当memoryMsgChan满了，则通过该组件将消息落盘传递
 	backend BackendQueue
 
+	//用于在内存中传递当前channel下的消息
 	memoryMsgChan chan *Message
 	exitFlag      int32
 	exitMutex     sync.RWMutex
 
-	// state tracking
+	// state tracking 记录当前channel下的consumer集合
 	clients        map[int64]Consumer
 	paused         int32
 	ephemeral      bool
@@ -63,12 +71,23 @@ type Channel struct {
 	e2eProcessingLatencyStream *quantile.Quantile
 
 	// TODO: these can be DRYd up
+	//延时消息集合
 	deferredMessages map[MessageID]*pqueue.Item
-	deferredPQ       pqueue.PriorityQueue
-	deferredMutex    sync.Mutex
+
+	//延时消息队列，底层基于一个小顶堆实现，以执行时间戳作为排序的键
+	deferredPQ pqueue.PriorityQueue
+
+	//保护延时消息队列的互斥锁
+	deferredMutex sync.Mutex
+
+	//重试(待确认)消息集合
 	inFlightMessages map[MessageID]*Message
-	inFlightPQ       inFlightPqueue
-	inFlightMutex    sync.Mutex
+
+	//重试(待确认)消息队列，底层基于一个小顶堆实现，以执行时间戳作为排序的键
+	inFlightPQ inFlightPqueue
+
+	//保护重试(待确认)消息队列的互斥锁
+	inFlightMutex sync.Mutex
 }
 
 // NewChannel creates a new instance of the Channel type and returns a pointer
@@ -86,6 +105,7 @@ func NewChannel(topicName string, channelName string, nsqd *NSQD,
 	}
 	// avoid mem-queue if size == 0 for more consistent ordering
 	if nsqd.getOpts().MemQueueSize > 0 || c.ephemeral {
+		// 初始化消息channel， 并指定 channel 缓冲大小
 		c.memoryMsgChan = make(chan *Message, nsqd.getOpts().MemQueueSize)
 	}
 	if len(nsqd.getOpts().E2EProcessingLatencyPercentiles) > 0 {
